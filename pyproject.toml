@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "kiwi-skin"
-version = "0.2.0"
+version = "0.2.1"
 description = "Prompt injection sanitizer for AI agents — guards user input, RAG chunks, tool outputs, and LLM responses"
 readme = "README.md"
 license = { text = "MIT" }
