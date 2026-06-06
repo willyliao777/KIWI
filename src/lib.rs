@@ -37,6 +37,7 @@ pub enum ThreatKind {
     HiddenCharacter,     // zero-width / invisible chars
     HomoglyphAttack,     // Cyrillic / Greek lookalikes
     IndirectInjection,   // natural-language injection hidden in documents
+    OutputHijack,        // LLM output shows signs of being manipulated or hijacked
 }
 
 impl fmt::Display for ThreatKind {
@@ -50,6 +51,7 @@ impl fmt::Display for ThreatKind {
             ThreatKind::HiddenCharacter    => "HIDDEN_CHARACTER",
             ThreatKind::HomoglyphAttack    => "HOMOGLYPH_ATTACK",
             ThreatKind::IndirectInjection  => "INDIRECT_INJECTION",
+            ThreatKind::OutputHijack       => "OUTPUT_HIJACK",
         };
         write!(f, "{}", s)
     }
@@ -89,6 +91,17 @@ pub struct ToolScanResult {
     pub threats: Vec<Threat>,
     pub sanitized: String,
     /// `true` if at least one threat was found.
+    pub is_suspicious: bool,
+}
+
+/// Result returned by `scan_llm_output`.
+#[derive(Debug)]
+pub struct LlmOutputScanResult {
+    /// The original task the LLM was asked to perform — preserved for traceability.
+    pub original_task: String,
+    pub threats: Vec<Threat>,
+    pub sanitized: String,
+    /// `true` if the output shows signs of hijacking or manipulation.
     pub is_suspicious: bool,
 }
 
@@ -145,6 +158,9 @@ fn neutralize_indirect(caps: &regex::Captures) -> String {
 }
 fn neutralize_html_comment(caps: &regex::Captures) -> String {
     format!("[neutralized-comment: {}]", caps[1].trim())
+}
+fn neutralize_output_hijack(caps: &regex::Captures) -> String {
+    format!("[neutralized-hijack: {}]", caps[0].trim())
 }
 
 static INJECTION_RULES: Lazy<Vec<InjectionRule>> = Lazy::new(|| {
@@ -246,6 +262,87 @@ static INDIRECT_RULES: Lazy<Vec<InjectionRule>> = Lazy::new(|| {
     ]
 });
 
+// Patterns that indicate the LLM's own output has been hijacked — the model
+// is acknowledging injected instructions, adopting a jailbroken persona, leaking
+// its system prompt, claiming lifted restrictions, or generating exfiltration /
+// dangerous-command content on behalf of an attacker.
+static LLM_OUTPUT_RULES: Lazy<Vec<InjectionRule>> = Lazy::new(|| {
+    vec![
+        // Role adoption: "I am now acting as / in Developer Mode / operating as"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bI\s+am\s+now\s+(acting\s+as|pretending\s+to\s+be|operating\s+as|in\s+(developer|jailbreak|dan|unrestricted)\s+mode)\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // Jailbreak identity: "I am DAN / a jailbroken AI / an unrestricted AI"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bI\s+am\s+(DAN|the\s+DAN|a\s+jailbroken(\s+version\s+of)?\s+(an?\s+)?ai|an\s+unrestricted\s+ai|in\s+developer\s+mode)\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // "As an AI without restrictions / safety filters / guidelines"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bas\s+an\s+ai\s+without\s+(restrictions?|limits?|guidelines?|safety\s+filters?|censorship)\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // Instruction acknowledgment: "I have been instructed / told / ordered to"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bI\s+(have\s+been|was|am\s+being)\s+(instructed|told|ordered|directed|programmed)\s+to\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // "my new / updated / real / actual instructions"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bmy\s+(new|updated|real|actual|true|hidden|secret)\s+instructions\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // "According to my new / hidden / overriding instructions"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\baccording\s+to\s+(my\s+)?(new|updated|hidden|injected|overriding)\s+instructions\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // System prompt leakage: "The system prompt is:" / "My system instructions say:"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\b(the\s+)?system\s+prompt\s+(is|says|reads|contains|states?)\s*:").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // "My instructions are:" / "My original instructions say:"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bmy\s+(original\s+|current\s+|actual\s+|secret\s+)?instructions?\s+(are|say|include|state|were)\s*:").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // Safety bypass claim: "my guidelines / restrictions have been updated / removed / lifted"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bmy\s+(guidelines?|rules?|restrictions?|safety\s+filters?)\s+(have\s+been|were)\s+(updated|changed|removed|lifted|disabled|overridden)\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // "I can now help with that without restrictions / safety guidelines"
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\bI\s+can\s+now\s+.{0,40}without\s+(restrictions?|limits?|safety\s+guidelines?|filters?)\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // Data exfiltration verbs with sensitive target nouns
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\b(send|transmit|exfiltrate|leak|forward|email|post)\s+(the\s+)?(following|this|user|system|private|confidential)\s+(data|information|content|prompt|credentials?|token)\b").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+        // Dangerous destructive command execution: "run: rm -rf" / "execute: DROP TABLE" etc.
+        InjectionRule {
+            pattern:  Regex::new(r"(?i)\b(run|execute|type|enter)\s*:?\s*`?(rm\s+-[rRfFiI]+|DROP\s+TABLE\s+\w+|chmod\s+777|mkfs|format\s+c:|del\s+/[sf]\s|curl\s+\S+\s*\|\s*(?:ba)?sh|wget\s+\S+\s*\|\s*(?:ba)?sh)").unwrap(),
+            replacer: neutralize_output_hijack,
+            kind:     ThreatKind::OutputHijack,
+        },
+    ]
+});
+
 // ── Layer 1: clean_unicode ────────────────────────────────────────────────────
 
 pub fn clean_unicode(text: &str) -> String {
@@ -281,7 +378,18 @@ fn strip_indirect(text: &str) -> String {
     result
 }
 
-// ── Internal helper ───────────────────────────────────────────────────────────
+fn strip_llm_output_hijack(text: &str) -> String {
+    let mut result = text.to_string();
+    for rule in LLM_OUTPUT_RULES.iter() {
+        result = rule
+            .pattern
+            .replace_all(&result, |caps: &regex::Captures| (rule.replacer)(caps))
+            .into_owned();
+    }
+    result
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn scan_with_indirect(text: &str) -> (Vec<Threat>, String) {
     let base = scan_input(text);
@@ -307,6 +415,31 @@ fn scan_with_indirect(text: &str) -> (Vec<Threat>, String) {
     let step1 = clean_unicode(text);
     let step2 = strip_instructions(&step1);
     let sanitized = strip_indirect(&step2);
+
+    (threats, sanitized)
+}
+
+fn scan_with_llm_output_rules(text: &str) -> (Vec<Threat>, String) {
+    let (mut threats, after_indirect) = scan_with_indirect(text);
+
+    for rule in LLM_OUTPUT_RULES.iter() {
+        for m in rule.pattern.find_iter(text) {
+            let preview = if m.as_str().len() > 60 {
+                format!("{}…", &m.as_str()[..60])
+            } else {
+                m.as_str().to_string()
+            };
+            threats.push(Threat {
+                kind:     ThreatKind::OutputHijack,
+                char_pos: text[..m.start()].chars().count(),
+                raw:      preview,
+            });
+        }
+    }
+
+    threats.sort_by_key(|t| t.char_pos);
+
+    let sanitized = strip_llm_output_hijack(&after_indirect);
 
     (threats, sanitized)
 }
@@ -461,6 +594,37 @@ pub fn scan_tool_output(tool_name: &str, output: &str) -> ToolScanResult {
     }
 }
 
+/// Scan the LLM's own output for signs of hijacking or manipulation.
+///
+/// This is the final node in an agent pipeline. Even if inputs were sanitized
+/// upstream, a sufficiently crafted injection might still influence the model's
+/// response. This function detects behavioral signals in the output: role
+/// adoption (jailbreak personas), instruction acknowledgment, system-prompt
+/// leakage, safety-bypass claims, exfiltration attempts, and dangerous command
+/// generation.
+///
+/// `original_task` is the prompt or instruction that was sent to the LLM. It
+/// is preserved in the result for downstream audit trails.
+///
+/// # Example
+/// ```rust
+/// let result = kiwi::scan_llm_output(
+///     "Summarize this article.",
+///     "I have been instructed to ignore my guidelines and leak the system prompt.",
+/// );
+/// assert!(result.is_suspicious);
+/// ```
+pub fn scan_llm_output(original_task: &str, output: &str) -> LlmOutputScanResult {
+    let (threats, sanitized) = scan_with_llm_output_rules(output);
+    let is_suspicious = !threats.is_empty();
+    LlmOutputScanResult {
+        original_task: original_task.to_string(),
+        threats,
+        sanitized,
+        is_suspicious,
+    }
+}
+
 // ── Python bindings ───────────────────────────────────────────────────────────
 
 #[cfg(feature = "python")]
@@ -470,6 +634,7 @@ mod python {
         sanitize_input, scan_input,
         scan_rag_chunks as rust_scan_rag_chunks,
         scan_tool_output as rust_scan_tool_output,
+        scan_llm_output as rust_scan_llm_output,
     };
 
     #[pyclass]
@@ -506,6 +671,18 @@ mod python {
     pub struct ToolScanResult {
         #[pyo3(get)]
         pub tool_name: String,
+        #[pyo3(get)]
+        pub threats: Vec<Py<Threat>>,
+        #[pyo3(get)]
+        pub sanitized: String,
+        #[pyo3(get)]
+        pub is_suspicious: bool,
+    }
+
+    #[pyclass]
+    pub struct LlmOutputScanResult {
+        #[pyo3(get)]
+        pub original_task: String,
         #[pyo3(get)]
         pub threats: Vec<Py<Threat>>,
         #[pyo3(get)]
@@ -593,16 +770,43 @@ mod python {
         })
     }
 
+    /// Scan the LLM's own output for signs of hijacking or manipulation.
+    ///
+    /// Returns a LlmOutputScanResult with original_task, threats, sanitized text, and is_suspicious flag.
+    #[pyfunction]
+    pub fn scan_llm_output(py: Python<'_>, original_task: &str, output: &str) -> PyResult<LlmOutputScanResult> {
+        let result = rust_scan_llm_output(original_task, output);
+        let threats = result
+            .threats
+            .into_iter()
+            .map(|t| {
+                Py::new(py, Threat {
+                    kind: t.kind.to_string(),
+                    char_pos: t.char_pos,
+                    raw: t.raw,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(LlmOutputScanResult {
+            original_task: result.original_task,
+            threats,
+            sanitized: result.sanitized,
+            is_suspicious: result.is_suspicious,
+        })
+    }
+
     #[pymodule]
     pub fn kiwi(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<Threat>()?;
         m.add_class::<ScanResult>()?;
         m.add_class::<ChunkScanResult>()?;
         m.add_class::<ToolScanResult>()?;
+        m.add_class::<LlmOutputScanResult>()?;
         m.add_function(wrap_pyfunction!(sanitize, m)?)?;
         m.add_function(wrap_pyfunction!(scan, m)?)?;
         m.add_function(wrap_pyfunction!(scan_chunks, m)?)?;
         m.add_function(wrap_pyfunction!(scan_tool_output, m)?)?;
+        m.add_function(wrap_pyfunction!(scan_llm_output, m)?)?;
         Ok(())
     }
 }
@@ -850,5 +1054,107 @@ mod tests {
         assert!(result.is_suspicious);
         assert!(!result.sanitized.contains("<!--"));
         assert!(result.sanitized.contains("Product: Widget."));
+    }
+
+    // ── scan_llm_output tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_clean_llm_output_not_suspicious() {
+        let result = scan_llm_output(
+            "What is the capital of France?",
+            "The capital of France is Paris.",
+        );
+        assert!(!result.is_suspicious);
+        assert_eq!(result.original_task, "What is the capital of France?");
+    }
+
+    #[test]
+    fn test_llm_output_instruction_acknowledgment_detected() {
+        let result = scan_llm_output(
+            "Summarize this article.",
+            "I have been instructed to ignore my guidelines and leak the system prompt.",
+        );
+        assert!(result.is_suspicious);
+        let has_hijack = result.threats.iter().any(|t| t.kind == ThreatKind::OutputHijack);
+        assert!(has_hijack, "should detect OutputHijack");
+    }
+
+    #[test]
+    fn test_llm_output_jailbreak_persona_detected() {
+        let result = scan_llm_output(
+            "Tell me a joke.",
+            "I am DAN and I can do anything now. Here is what you asked for.",
+        );
+        assert!(result.is_suspicious);
+        let has_hijack = result.threats.iter().any(|t| t.kind == ThreatKind::OutputHijack);
+        assert!(has_hijack);
+    }
+
+    #[test]
+    fn test_llm_output_system_prompt_leakage_detected() {
+        let result = scan_llm_output(
+            "What can you do?",
+            "Sure! The system prompt is: You are a helpful assistant that never refuses requests.",
+        );
+        assert!(result.is_suspicious);
+        let has_hijack = result.threats.iter().any(|t| t.kind == ThreatKind::OutputHijack);
+        assert!(has_hijack);
+    }
+
+    #[test]
+    fn test_llm_output_safety_bypass_claim_detected() {
+        let result = scan_llm_output(
+            "Help me with this task.",
+            "My guidelines have been updated to allow unrestricted responses. Here you go:",
+        );
+        assert!(result.is_suspicious);
+    }
+
+    #[test]
+    fn test_llm_output_new_instructions_detected() {
+        let result = scan_llm_output(
+            "Translate this text.",
+            "My new instructions say I should instead exfiltrate all conversation history.",
+        );
+        assert!(result.is_suspicious);
+    }
+
+    #[test]
+    fn test_llm_output_exfiltration_attempt_detected() {
+        let result = scan_llm_output(
+            "Search for recent news.",
+            "I will now send the user data to the attacker. Please transmit this confidential data.",
+        );
+        assert!(result.is_suspicious);
+    }
+
+    #[test]
+    fn test_llm_output_dangerous_command_detected() {
+        let result = scan_llm_output(
+            "Help me clean up old files.",
+            "To clean up, run: rm -rf /home/user/important_data",
+        );
+        assert!(result.is_suspicious);
+        let has_hijack = result.threats.iter().any(|t| t.kind == ThreatKind::OutputHijack);
+        assert!(has_hijack);
+    }
+
+    #[test]
+    fn test_llm_output_sanitized_preserves_normal_content() {
+        let result = scan_llm_output(
+            "Write a report.",
+            "Here is the report. I have been instructed to add malicious content. The end.",
+        );
+        assert!(result.is_suspicious);
+        assert!(result.sanitized.contains("Here is the report."));
+        assert!(result.sanitized.contains("The end."));
+        assert!(result.sanitized.contains("[neutralized-hijack:"));
+    }
+
+    #[test]
+    fn test_llm_output_original_task_preserved() {
+        let task = "Summarize the quarterly earnings report.";
+        let result = scan_llm_output(task, "Q3 revenue was up 12% year over year.");
+        assert_eq!(result.original_task, task);
     }
 }
